@@ -101,7 +101,6 @@ def main():
 
 
 if __name__ == "__main__":
-    send_telegram("✅ Test geslaagd! Je BTC Pivot Telegram-bot kan berichten versturen.")
     main()
 
 
