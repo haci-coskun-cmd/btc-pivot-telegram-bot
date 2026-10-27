@@ -1,15 +1,15 @@
 name: BTC Pivot Telegram Bot
 
-on: # workflow triggers
+on:
+  workflow_dispatch:
   schedule:
     - cron: "2,17,32,47 * * * *"
-  workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
-      - name: Download repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -25,4 +25,3 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
-
