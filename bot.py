@@ -99,6 +99,9 @@ def main():
             f"pivot=${pivot:,.2f}, SMA200=${sma200:,.2f}"
         )
 
+
 if __name__ == "__main__":
+    send_telegram("✅ Test geslaagd! Je BTC Pivot Telegram-bot kan berichten versturen.")
     main()
+
 
