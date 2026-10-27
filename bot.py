@@ -1,105 +1,104 @@
+
 import os
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-BINANCE = "https://api.binance.com"
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-INTERVAL = "15m"
-MA_PERIOD = 200
-NEAR_PIVOT_PERCENT = 0.001  # 0.10%
+BASE_URL = "https://api.exchange.coinbase.com"
+PRODUCT = "BTC-USD"
+HEADERS = {"User-Agent": "BTC-Pivot-Telegram-Bot"}
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+def get_candles(granularity, count):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(seconds=granularity * count)
 
-def get_klines(interval, limit):
     response = requests.get(
-        f"{BINANCE}/api/v3/klines",
-        params={"symbol": SYMBOL, "interval": interval, "limit": limit},
+        f"{BASE_URL}/products/{PRODUCT}/candles",
+        params={
+            "granularity": granularity,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        },
+        headers=HEADERS,
         timeout=20,
     )
     response.raise_for_status()
-    return response.json()
 
-def closed_candles(rows):
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    return [row for row in rows if int(row[6]) < now_ms]
-
-def get_daily_pivot():
-    rows = get_klines("1d", 4)
-    closed = closed_candles(rows)
-    if not closed:
-        raise RuntimeError("Geen gesloten dagelijkse candle ontvangen.")
-    # Laatste volledig gesloten dag
-    candle = closed[-1]
-    high, low, close = float(candle[2]), float(candle[3]), float(candle[4])
-    pivot = (high + low + close) / 3
-    return pivot, high, low, close
+    # Coinbase candle format: time, low, high, open, close, volume
+    rows = sorted(response.json(), key=lambda row: row[0])
+    if not rows:
+        raise RuntimeError("Coinbase heeft geen candles teruggegeven.")
+    return rows
 
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Vul TELEGRAM_BOT_TOKEN en TELEGRAM_CHAT_ID in bij GitHub Secrets.")
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
     response = requests.post(
-        url,
-        data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={"chat_id": chat_id, "text": message},
         timeout=20,
     )
     response.raise_for_status()
 
 def main():
-    daily_pivot, day_high, day_low, day_close = get_daily_pivot()
+    daily = get_candles(86400, 3)
+    today_utc = datetime.now(timezone.utc).date()
 
-    rows = get_klines(INTERVAL, MA_PERIOD + 3)
-    closed = closed_candles(rows)
-    if len(closed) < MA_PERIOD + 1:
-        raise RuntimeError("Niet genoeg gesloten 15-minutencandles voor MA200.")
+    # Neem de meest recente volledig gesloten dag.
+    completed_days = [
+        row for row in daily
+        if datetime.fromtimestamp(row[0], timezone.utc).date() < today_utc
+    ]
+    if not completed_days:
+        raise RuntimeError("Geen gesloten dagelijkse candle gevonden.")
 
-    # Gebruik alleen gesloten candles; vergelijk de laatste twee gesloten candles.
+    previous_day = completed_days[-1]
+    day_low, day_high, day_close = (
+        float(previous_day[1]),
+        float(previous_day[2]),
+        float(previous_day[4]),
+    )
+    pivot = (day_high + day_low + day_close) / 3
+
+    candles = get_candles(900, 230)
+    # Negeer de nog lopende 15-minutencandle.
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    closed = [row for row in candles if row[0] + 900 <= now_ts]
+
+    if len(closed) < 201:
+        raise RuntimeError("Niet genoeg gesloten 15-minutencandles voor SMA200.")
+
     closes = [float(row[4]) for row in closed]
     previous_close = closes[-2]
     current_close = closes[-1]
-    ma200 = sum(closes[-MA_PERIOD:]) / MA_PERIOD
+    sma200 = sum(closes[-200:]) / 200
 
-    fib_range = day_high - day_low
-    fib_382 = day_low + fib_range * 0.382
-    fib_618 = day_low + fib_range * 0.618
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    near_pivot = abs(current_close - daily_pivot) / daily_pivot <= NEAR_PIVOT_PERCENT
-
-    signal = None
-    if previous_close <= daily_pivot and current_close > daily_pivot and current_close > ma200:
-        signal = "🟢 LONG-signaal"
-    elif previous_close >= daily_pivot and current_close < daily_pivot and current_close < ma200:
-        signal = "🔴 SHORT-signaal"
-
-    if signal:
+    message = None
+    if previous_close <= pivot and current_close > pivot and current_close > sma200:
         message = (
-            f"{signal} — {SYMBOL}\n"
-            f"Tijd: {now}\n"
-            f"15m slotkoers: {current_close:.2f}\n"
-            f"Dagpivot: {daily_pivot:.2f}\n"
-            f"SMA200 (15m): {ma200:.2f}\n"
-            f"Vorige dag H/L/C: {day_high:.2f} / {day_low:.2f} / {day_close:.2f}\n"
-            f"Fibonacci 0.382: {fib_382:.2f}\n"
-            f"Fibonacci 0.618: {fib_618:.2f}\n\n"
-            "Dit is alleen een melding, geen automatische order of financieel advies."
+            "🟢 BTC LONG-signaal\n"
+            f"Prijs: ${current_close:,.2f}\n"
+            f"Pivot: ${pivot:,.2f}\n"
+            f"SMA200: ${sma200:,.2f}\n"
+            "Voorwaarde: gesloten 15m-candle boven pivot en SMA200."
         )
+    elif previous_close >= pivot and current_close < pivot and current_close < sma200:
+        message = (
+            "🔴 BTC SHORT-signaal\n"
+            f"Prijs: ${current_close:,.2f}\n"
+            f"Pivot: ${pivot:,.2f}\n"
+            f"SMA200: ${sma200:,.2f}\n"
+            "Voorwaarde: gesloten 15m-candle onder pivot en SMA200."
+        )
+
+    if message:
         send_telegram(message)
-    elif near_pivot:
-        send_telegram(
-            f"📍 BTC dicht bij dagpivot\n"
-            f"Tijd: {now}\n"
-            f"Koers: {current_close:.2f}\n"
-            f"Dagpivot: {daily_pivot:.2f}\n"
-            f"SMA200 (15m): {ma200:.2f}\n"
-            "Dit is alleen een melding, geen automatische order."
-        )
+        print("Telegram-signaal verzonden.")
     else:
         print(
-            f"Geen signaal. {now} | koers={current_close:.2f} "
-            f"pivot={daily_pivot:.2f} SMA200={ma200:.2f}"
+            f"Geen nieuw signaal. BTC=${current_close:,.2f}, "
+            f"pivot=${pivot:,.2f}, SMA200=${sma200:,.2f}"
         )
 
 if __name__ == "__main__":
     main()
+
