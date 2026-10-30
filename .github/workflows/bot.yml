@@ -1,27 +1,52 @@
+
 name: BTC Pivot Telegram Bot
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "2,17,32,47 * * * *"
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: btc-pivot-bot
+  cancel-in-progress: false
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
+      - name: Repository ophalen
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Python instellen
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install requests
+      - name: Dependencies installeren
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
 
-      - name: Run bot
+      - name: Vorige botstatus ophalen
+        uses: actions/cache/restore@v4
+        with:
+          path: bot_state.json
+          key: btc-pivot-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            btc-pivot-state-
+
+      - name: BTC Pivot bot uitvoeren
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
+
+      - name: Botstatus bewaren
+        uses: actions/cache/save@v4
+        with:
+          path: bot_state.json
+          key: btc-pivot-state-${{ github.run_id }}-${{ github.run_attempt }}
