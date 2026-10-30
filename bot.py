@@ -1,432 +1,276 @@
 
 import os
 import json
-import time
-import subprocess
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-
 import requests
-
-# ==========================================
-# INSTELLINGEN
-# ==========================================
+from datetime import datetime, timezone, timedelta
 
 BASE_URL = "https://api.exchange.coinbase.com"
 PRODUCT = "BTC-USD"
+GRANULARITY = 900
+CANDLE_LIMIT = 300
+STATE_FILE = "bot_state.json"
+TIMEOUT = 20
 
-INTERVAL = 900          # 15 minuten
-DAILY_INTERVAL = 86400  # 1 dag
-MAX_CANDLES = 300
-
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-STATE_FILE = Path("bot_state.json")
-
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "BTC-Pivot-Telegram-Bot/1.0",
-    "Accept": "application/json"
-})
+HEADERS = {
+    "User-Agent": "BTC-Pivot-Telegram-Bot/2.0"
+}
 
 
-# ==========================================
-# TIJD
-# ==========================================
+def get_candles():
+    """Haal maximaal 300 candles van Coinbase op."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(seconds=GRANULARITY * CANDLE_LIMIT)
 
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def iso_time(timestamp):
-    return datetime.fromtimestamp(
-        timestamp, timezone.utc
-    ).isoformat().replace("+00:00", "Z")
-
-
-def latest_closed_candle():
-    now = int(utc_now().timestamp())
-    return (now // INTERVAL) * INTERVAL - INTERVAL
-
-
-# ==========================================
-# COINBASE DATA
-# ==========================================
-
-def get_candles(start, end, granularity):
-    url = f"{BASE_URL}/products/{PRODUCT}/candles"
-
-    params = {
-        "start": iso_time(start),
-        "end": iso_time(end),
-        "granularity": granularity
-    }
-
-    response = SESSION.get(
-        url,
-        params=params,
-        timeout=20
+    response = requests.get(
+        f"{BASE_URL}/products/{PRODUCT}/candles",
+        params={
+            "granularity": GRANULARITY,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        },
+        headers=HEADERS,
+        timeout=TIMEOUT,
     )
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Coinbase fout {response.status_code}: "
-            f"{response.text[:500]}"
-        )
+    response.raise_for_status()
 
-    data = response.json()
+    rows = sorted(response.json(), key=lambda row: row[0])
 
-    if not isinstance(data, list):
-        raise RuntimeError("Ongeldig Coinbase candle-antwoord")
+    if not rows:
+        raise RuntimeError("Coinbase heeft geen candles teruggegeven.")
 
-    candles = []
+    now_ts = int(datetime.now(timezone.utc).timestamp())
 
-    for row in data:
-        if len(row) < 6:
-            continue
-
-        candles.append({
-            "time": int(row[0]),
-            "low": float(row[1]),
-            "high": float(row[2]),
-            "open": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[5])
-        })
-
-    candles.sort(key=lambda x: x["time"])
-
-    return candles
-
-
-# ==========================================
-# DAGELIJKSE PIVOT
-# VORIGE VOLLEDIG GESLOTEN UTC-DAG
-# ==========================================
-
-def get_daily_pivot():
-    today = utc_now().replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-
-    today_timestamp = int(today.timestamp())
-    yesterday_timestamp = today_timestamp - DAILY_INTERVAL
-
-    candles = get_candles(
-        yesterday_timestamp,
-        today_timestamp,
-        DAILY_INTERVAL
-    )
-
-    previous_day = [
-        candle for candle in candles
-        if candle["time"] == yesterday_timestamp
+    # Alleen volledig gesloten candles gebruiken.
+    closed = [
+        row for row in rows
+        if row[0] + GRANULARITY <= now_ts
     ]
 
-    if not previous_day:
+    if len(closed) < 200:
         raise RuntimeError(
-            "Coinbase heeft geen volledige candle "
-            "voor de vorige UTC-dag teruggegeven."
+            f"Onvoldoende gesloten candles: {len(closed)}"
         )
 
-    candle = previous_day[0]
-
-    pivot = (
-        candle["high"] +
-        candle["low"] +
-        candle["close"]
-    ) / 3
-
-    return pivot
+    return closed
 
 
-# ==========================================
-# TELEGRAM
-# ==========================================
+def get_daily_pivot():
+    """Pivot van de vorige volledig gesloten UTC-dag."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=5)
+
+    response = requests.get(
+        f"{BASE_URL}/products/{PRODUCT}/candles",
+        params={
+            "granularity": 86400,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        },
+        headers=HEADERS,
+        timeout=TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    rows = sorted(response.json(), key=lambda row: row[0])
+
+    today = end.date()
+
+    completed = [
+        row for row in rows
+        if datetime.fromtimestamp(
+            row[0], timezone.utc
+        ).date() < today
+    ]
+
+    if not completed:
+        raise RuntimeError("Geen gesloten dagcandle gevonden.")
+
+    previous_day = completed[-1]
+
+    low = float(previous_day[1])
+    high = float(previous_day[2])
+    close = float(previous_day[4])
+
+    pivot = (high + low + close) / 3
+
+    return pivot, high, low, close
+
+
+def load_state():
+    """Lees de laatst verwerkte candle."""
+    if not os.path.exists(STATE_FILE):
+        return None
+
+    try:
+        with open(STATE_FILE, "r") as file:
+            return json.load(file)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_state(timestamp):
+    """Bewaar de laatst verwerkte candle."""
+    state = {
+        "last_processed_candle": int(timestamp)
+    }
+
+    with open(STATE_FILE, "w") as file:
+        json.dump(state, file, indent=2)
+
 
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    """Verstuur een Telegram-bericht."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN of TELEGRAM_CHAT_ID ontbreekt."
+            "Telegram Secrets ontbreken."
         )
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
-
-    response = SESSION.post(
-        url,
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
+    response = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        json={
+            "chat_id": chat_id,
             "text": message
         },
-        timeout=20
+        timeout=TIMEOUT,
     )
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Telegram fout: {response.text[:500]}"
-        )
+    response.raise_for_status()
 
     result = response.json()
 
     if not result.get("ok"):
-        raise RuntimeError(f"Telegram fout: {result}")
+        raise RuntimeError("Telegram heeft het bericht niet bevestigd.")
 
 
-# ==========================================
-# STATUS OPSLAAN
-# ==========================================
+def check_signal(previous_close, current_close, sma200, pivot):
+    """Controleer Pivot-kruising met SMA200-filter."""
 
-def load_state():
-    if not STATE_FILE.exists():
-        return {}
+    # LONG: van onder naar boven de Pivot.
+    if (
+        previous_close <= pivot
+        and current_close > pivot
+        and current_close > sma200
+    ):
+        return "LONG"
 
-    with STATE_FILE.open("r", encoding="utf-8") as file:
-        return json.load(file)
+    # SHORT: van boven naar onder de Pivot.
+    if (
+        previous_close >= pivot
+        and current_close < pivot
+        and current_close < sma200
+    ):
+        return "SHORT"
 
+    return None
 
-def save_state(state):
-    temporary_file = STATE_FILE.with_suffix(".tmp")
-
-    with temporary_file.open("w", encoding="utf-8") as file:
-        json.dump(state, file, indent=2)
-
-    temporary_file.replace(STATE_FILE)
-
-
-def commit_state():
-    # In GitHub Actions bewaren we de status
-    # in de repository, zodat volgende runs
-    # dezelfde verwerkte candles herkennen.
-
-    if os.environ.get("GITHUB_ACTIONS") != "true":
-        return
-
-    subprocess.run(
-        ["git", "config", "user.name", "github-actions[bot]"],
-        check=True
-    )
-
-    subprocess.run(
-        [
-            "git", "config", "user.email",
-            "41898282+github-actions[bot]@users.noreply.github.com"
-        ],
-        check=True
-    )
-
-    subprocess.run(
-        ["git", "add", str(STATE_FILE)],
-        check=True
-    )
-
-    result = subprocess.run(
-        ["git", "diff", "--cached", "--quiet"]
-    )
-
-    if result.returncode == 0:
-        return
-
-    if result.returncode != 1:
-        raise RuntimeError("Git kon de status niet controleren.")
-
-    subprocess.run(
-        ["git", "commit", "-m", "Update BTC Pivot bot state"],
-        check=True
-    )
-
-    subprocess.run(
-        ["git", "push", "origin", "HEAD"],
-        check=True
-    )
-
-
-# ==========================================
-# 15 MINUTEN CANDLES OPHALEN
-# GEMISTE CANDLES VERWERKEN
-# ==========================================
-
-def get_new_candles(last_processed, latest_closed):
-    result = []
-
-    start = last_processed
-
-    while start <= latest_closed:
-        end = min(
-            start + MAX_CANDLES * INTERVAL,
-            latest_closed + INTERVAL
-        )
-
-        candles = get_candles(
-            start,
-            end,
-            INTERVAL
-        )
-
-        result.extend(candles)
-
-        start = end
-
-        time.sleep(0.25)
-
-    unique = {}
-
-    for candle in result:
-        if (
-            candle["time"] > last_processed
-            and candle["time"] <= latest_closed
-        ):
-            unique[candle["time"]] = candle
-
-    return sorted(
-        unique.values(),
-        key=lambda x: x["time"]
-    )
-
-
-# ==========================================
-# HOOFDFUNCTIE
-# ==========================================
 
 def main():
-
     print("BTC Pivot Telegram Bot gestart")
+    print("Coinbase: BTC-USD")
+
+    pivot, day_high, day_low, day_close = get_daily_pivot()
+
+    print(f"Dagelijkse Pivot: {pivot:.2f}")
+
+    candles = get_candles()
+    closes = [float(row[4]) for row in candles]
 
     state = load_state()
 
-    pivot = get_daily_pivot()
+    latest_timestamp = candles[-1][0]
 
-    print(f"Coinbase: {PRODUCT}")
-    print(f"Dagelijkse Pivot: {pivot:.2f}")
+    # Eerste start: geen oude signalen versturen.
+    if state is None:
+        save_state(latest_timestamp)
 
-    latest_closed = latest_closed_candle()
+        print("Eerste start: beginpositie opgeslagen.")
+        print("Wachten op nieuwe gesloten candles.")
+        return
 
-    # Eerste uitvoering:
-    # controleer alleen de meest recente
-    # volledig gesloten candle.
-
-    if "last_processed" not in state:
-        state["last_processed"] = (
-            latest_closed - INTERVAL
-        )
-
-    last_processed = int(state["last_processed"])
-
-    if last_processed > latest_closed:
-        raise RuntimeError(
-            "Opgeslagen candle-status ligt in de toekomst."
-        )
-
-    candles = get_new_candles(
-        last_processed,
-        latest_closed
+    last_processed = int(
+        state.get("last_processed_candle", 0)
     )
 
-    print(f"Nieuwe candles gevonden: {len(candles)}")
+    new_indices = [
+        i for i, candle in enumerate(candles)
+        if candle[0] > last_processed
+    ]
 
-    # Haal ook de laatst verwerkte candle op
-    # om de vorige slotkoers te kunnen vergelijken.
+    print(f"Nieuwe candles gevonden: {len(new_indices)}")
 
-    previous_candles = get_candles(
-        last_processed - INTERVAL,
-        last_processed + INTERVAL,
-        INTERVAL
-    )
+    if not new_indices:
+        print("Geen nieuwe candles.")
+        return
 
-    previous = next(
-        (
-            candle for candle in previous_candles
-            if candle["time"] == last_processed
-        ),
-        None
-    )
+    processed_timestamp = last_processed
 
-    if candles and previous is None:
-        raise RuntimeError(
-            "Vorige candle ontbreekt. "
-            "Status wordt niet vooruitgeschoven."
+    for i in new_indices:
+
+        # Voor SMA200 zijn 199 eerdere candles nodig.
+        if i < 199:
+            print("Onvoldoende historische data voor SMA200.")
+            continue
+
+        previous_close = closes[i - 1]
+        current_close = closes[i]
+
+        sma200 = sum(closes[i - 199:i + 1]) / 200
+
+        signal = check_signal(
+            previous_close,
+            current_close,
+            sma200,
+            pivot
         )
 
-    for candle in candles:
+        candle_timestamp = candles[i][0]
 
-        current_time = candle["time"]
+        candle_time = datetime.fromtimestamp(
+            candle_timestamp,
+            timezone.utc
+        ).strftime("%Y-%m-%d %H:%M UTC")
 
-        # Alleen opeenvolgende gesloten candles
-        # mogen een kruissignaal veroorzaken.
-
-        consecutive = (
-            previous is not None
-            and current_time == previous["time"] + INTERVAL
+        print(
+            f"{candle_time} | "
+            f"BTC: ${current_close:,.2f} | "
+            f"Pivot: ${pivot:,.2f} | "
+            f"SMA200: ${sma200:,.2f} | "
+            f"Signaal: {signal or 'Geen'}"
         )
 
-        if consecutive:
+        if signal:
+            emoji = "🟢" if signal == "LONG" else "🔴"
 
-            previous_close = previous["close"]
-            current_close = candle["close"]
+            message = (
+                f"{emoji} BTC {signal}-SIGNAAL\n\n"
+                f"Markt: BTC/USD (Coinbase)\n"
+                f"Tijdframe: 15 minuten\n"
+                f"Candle: {candle_time}\n\n"
+                f"Sluitprijs: ${current_close:,.2f}\n"
+                f"Dagelijkse Pivot: ${pivot:,.2f}\n"
+                f"SMA200: ${sma200:,.2f}\n\n"
+                f"Voorwaarden: Pivot-kruising + SMA200-filter.\n"
+                f"Dit is een signaal, geen financieel advies."
+            )
 
-            signal = None
+            # Pas na bevestiging door Telegram verdergaan.
+            send_telegram(message)
 
-            # LONG: van onder naar boven door Pivot
+            print(f"Telegram {signal} verzonden.")
 
-            if (
-                previous_close <= pivot
-                and current_close > pivot
-            ):
-                signal = "LONG"
+        processed_timestamp = candle_timestamp
 
-            # SHORT: van boven naar beneden door Pivot
-
-            elif (
-                previous_close >= pivot
-                and current_close < pivot
-            ):
-                signal = "SHORT"
-
-            if signal:
-
-                candle_time = datetime.fromtimestamp(
-                    current_time,
-                    timezone.utc
-                ).strftime("%d-%m-%Y %H:%M UTC")
-
-                message = (
-                    f"BTC PIVOT {signal}\n\n"
-                    f"Exchange: Coinbase\n"
-                    f"Pair: BTC-USD\n"
-                    f"Timeframe: 15 minuten\n\n"
-                    f"Pivot: ${pivot:,.2f}\n"
-                    f"Vorige close: ${previous_close:,.2f}\n"
-                    f"Huidige close: ${current_close:,.2f}\n\n"
-                    f"Candle: {candle_time}"
-                )
-
-                print(message)
-
-                send_telegram(message)
-
-        # Ook candles zonder signaal markeren
-        # als verwerkt om dubbele verwerking te voorkomen.
-
-        state["last_processed"] = current_time
-        save_state(state)
-
-        previous = candle
-
-    commit_state()
+    # Alleen opslaan nadat alle nieuwe candles verwerkt zijn.
+    save_state(processed_timestamp)
 
     print("Bot succesvol uitgevoerd.")
-    print(
-        f"Laatst verwerkte candle: "
-        f"{state['last_processed']}"
-    )
+    print(f"Laatst verwerkte candle: {processed_timestamp}")
 
-
-# ==========================================
-# START
-# ==========================================
 
 if __name__ == "__main__":
     main()
